@@ -1,0 +1,28 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: age-of-voyages
+
+  # ---- MySQL 持久化（本地：root/REMOVED）----
+  datasource:
+    url: jdbc:mysql://localhost:3306/age_of_voyages?createDatabaseIfNotExist=true&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: root
+    password: REMOVED
+
+  # JSON 不输出 null 字段，前端更易读
+  jackson:
+    default-property-inclusion: non_null
+
+# ---- MyBatis（注意：必须顶层，不能缩进到 spring: 下）----
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true   # client_id -> clientId
+  type-handlers-package: com.ageofvoyages.model   # 注册 CargoTypeHandler
+  # MyBatis 不自动建表，表结构见 schemas/schema.sql
+
+logging:
+  level:
+    org.springframework.web.socket: INFO
+    com.ageofvoyages.repository: DEBUG   # 打印 MyBatis SQL，排障用

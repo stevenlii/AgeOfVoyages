@@ -1,0 +1,24 @@
+# ---------- Java / Maven ----------
+backend/target/
+*.class
+*.jar.original
+*.log
+
+# ---------- Node / 前端 ----------
+frontend/node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# ---------- 部署运行时产物 ----------
+deploy/jars/
+deploy/logs/
+deploy/release/
+deploy/config/env.yml
+deploy/data/
+deploy/.env
+
+# ---------- IDE / 系统 ----------
+.idea/
+.vscode/
+*.iml
+.DS_Store

@@ -1,0 +1,25 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: age-of-voyages
+
+  # ---- MySQL 持久化（生产环境请通过 config/env.yml 或用环境变量覆盖）----
+  datasource:
+    url: jdbc:mysql://localhost:3306/age_of_voyages?createDatabaseIfNotExist=true&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+    username: root
+    password: REMOVED
+
+  jackson:
+    default-property-inclusion: non_null
+
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true
+  type-handlers-package: com.ageofvoyages.model
+
+logging:
+  level:
+    org.springframework.web.socket: INFO
+    com.ageofvoyages.repository: DEBUG
