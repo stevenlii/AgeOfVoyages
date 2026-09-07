@@ -38,4 +38,4 @@ tar -xzvf deploy-<日期>.tar.gz && cd deploy-<日期> && ./bin/deploy.sh start
 ## 数据库
 
 - MySQL，库名 `age_of_voyages`（自动建库，表结构见 `backend/schemas/schema.sql`）
-- 默认连接 `localhost:3306`，账号 `root/REMOVED`，可用 `DB_URL` / `DB_USERNAME` / `DB_PASSWORD` 环境变量覆盖
+- 连接信息通过环境变量注入：`DB_URL` / `DB_USERNAME` / `DB_PASSWORD`（不在仓库明文保存账号密码）

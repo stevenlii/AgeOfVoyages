@@ -5,11 +5,11 @@ spring:
   application:
     name: age-of-voyages
 
-  # ---- MySQL 持久化（本地：root/REMOVED）----
+  # ---- MySQL 持久化（账号密码通过环境变量注入，不在仓库明文保存）----
   datasource:
-    url: jdbc:mysql://localhost:3306/age_of_voyages?createDatabaseIfNotExist=true&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
-    username: root
-    password: REMOVED
+    url: ${DB_URL:jdbc:mysql://localhost:3306/age_of_voyages?createDatabaseIfNotExist=true&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true}
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:}
 
   # JSON 不输出 null 字段，前端更易读
   jackson:

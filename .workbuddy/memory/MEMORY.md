@@ -3,7 +3,7 @@
 ## 技术栈（已定）
 - 后端：**Java 21 + Spring Boot 3.3.5（Maven）**，实时通信 **WebSocket/STOMP**（SockJS 端点 `/ws`）。
 - 前端：**Vue 3 + Vite**，`@stomp/stompjs` + `sockjs-client` 连后端。
-- 存储：**MySQL**（本地 root/REMOVED，库 `age_of_voyages`）+ **MyBatis**（2026-09-07 由 JPA 迁移而来，统一用户技术栈偏好）。实时状态在内存 Map，变更（login/trade/travel/到达）经 `PlayerMapper` 写回 `players` 表；货舱 `cargo` 由 `CargoTypeHandler` 以 JSON 文本列存取。
+- 存储：**MySQL**（本地账号密码经环境变量注入，不在仓库明文，库 `age_of_voyages`）+ **MyBatis**（2026-09-07 由 JPA 迁移而来，统一用户技术栈偏好）。实时状态在内存 Map，变更（login/trade/travel/到达）经 `PlayerMapper` 写回 `players` 表；货舱 `cargo` 由 `CargoTypeHandler` 以 JSON 文本列存取。
 - `players` 表结构：`client_id` VARCHAR(64) PK / name / gold / port / cargo_cap / cargo TEXT / traveling BIT(1) / traveling_to / arrive_at BIGINT。**MyBatis 不自动建表**，建表脚本在 `backend/schemas/schema.sql`。
 
 ## 运行方式
