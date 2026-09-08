@@ -2,6 +2,8 @@ package com.ageofvoyages.controller;
 
 import com.ageofvoyages.dto.ChatRequest;
 import com.ageofvoyages.dto.LoginRequest;
+import com.ageofvoyages.dto.SailDecisionRequest;
+import com.ageofvoyages.dto.SailRequest;
 import com.ageofvoyages.dto.TradeRequest;
 import com.ageofvoyages.dto.TravelRequest;
 import com.ageofvoyages.service.GameService;
@@ -22,6 +24,12 @@ public class GameController {
 
     @MessageMapping("travel")
     public void travel(TravelRequest r) { game.travel(r); }
+
+    @MessageMapping("sail")
+    public void sail(SailRequest r) { game.sail(r); }
+
+    @MessageMapping("sailDecision")
+    public void sailDecision(SailDecisionRequest r) { game.sailDecision(r); }
 
     @MessageMapping("trade")
     public void trade(TradeRequest r) { game.trade(r); }
