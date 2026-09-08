@@ -15,7 +15,7 @@ const statusText = computed(() => {
   const y = game.you
   if (!y) return '连接中…'
   const sailing = game.voyage
-    ? ` ｜ ⛵ 已航行 ${game.voyage.traveledKm}/${game.voyage.totalKm} 公里`
+    ? ` ｜ ⛵ 距目的地还有 ${game.voyage.remainingKm} 公里`
     : y.traveling ? ' ｜ ⛵ 航行中 ｜ 请到「航海图」继续' : ''
   return `👤 ${y.name} ｜ 💰 ${y.gold} ｜ 📍 ${portName(y.port)} ｜ 📦 舱位 ${cargoUsed()}/${y.cargoCap}${sailing}`
 })
@@ -42,7 +42,7 @@ onMounted(() => askPlayerName())
       <router-link to="/">🏝 港口市场</router-link>
       <a href="#" @click.prevent="goMap">🗺 航海图</a>
       <router-link v-if="game.voyage" to="/sail">
-        ⛵ {{ game.voyage.departed ? `继续航行（${game.voyage.clicks - game.voyage.clicked} 次）` : '查看航线（未出发）' }}
+        ⛵ {{ game.voyage.departed ? '继续航行' : '查看航线（未出发）' }}
       </router-link>
     </div>
 

@@ -60,7 +60,7 @@ function choose(p) {
           >
             <span class="pname">{{ p.name }}</span>
             <span class="pdist">
-              {{ p.id === here ? '📍 当前' : `距此约 ${p.distanceKm} 公里 · 约 ${Math.ceil(p.distanceKm / 10)} 次点击` }}
+              {{ p.id === here ? '📍 当前' : `距此约 ${p.distanceKm} 公里` }}
             </span>
           </a>
         </template>
