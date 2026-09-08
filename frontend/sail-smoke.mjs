@@ -100,10 +100,15 @@ const client = new Client({
       for (const ln of added) {
         if (ln.includes('【')) console.log(`   ✨ [${clicks}] ${ln}`)
       }
-      if (voy.offered) {
+      // 海盗对峙：随机拿个主意，别卡死
+      if (voy.pendCombat) {
+        const ch = ['fight', 'flee', 'pay'][Math.floor(Math.random() * 3)]
+        console.log(`   [${clicks}] 海盗对峙 -> ${ch}`)
+        client.publish({ destination: '/app/sailDecision', body: JSON.stringify({ clientId, choice: ch }) })
+      } else if (voy.offered) {
         console.log(`   [${clicks}] 途经地 ${voy.offered.name} -> 继续航行`)
         client.publish({ destination: '/app/sailDecision', body: JSON.stringify({ clientId, choice: 'continue' }) })
-      } else if (!backDone && voy.departed && Number(voy.traveledKm) >= 50) {
+      } else if (!backDone && voy.departed && Number(voy.traveledKm) >= 200) {
         kmBeforeBack = Number(voy.traveledKm)
         console.log(`   [${clicks}] 里程=${voy.traveledKm}km，后退 x1`)
         client.publish({ destination: '/app/sail', body: JSON.stringify({ clientId, dir: 'back' }) })

@@ -92,21 +92,23 @@ const client = new Client({
         if (/[🐬🕊🐟🐢🐳🌊⚡🌧☀️🎣💧🪼🌩]/.test(ln)) ambCount++
       }
 
-      // 天气延续性采样
-      // 天气延续性采样（从“已航行…｜ 天气：”数字行取值）
-      const cur2 = cur.slice(-8)
-      const wm = cur2.find(l => l.includes('已航行') && l.includes('｜ 天气：'))
-      if (wm) {
-        const w = wm.match(/｜ 天气：([^ ｜]+)/)[1]
+      // 天气延续性采样（取状态里的当前天气：应长时间保持同一天气、偶尔渐变）
+      const w = voy.weather
+      if (w) {
         if (weatherCur !== null && weatherCur !== w) weatherChanges++
         weatherCur = w
         weatherSamples++
       }
 
-      if (voy.offered) {
+      if (voy.pendCombat) {
+        const ch = ['fight', 'flee', 'pay'][Math.floor(Math.random() * 3)]
+        console.log(`   [${clicks}] 海盗对峙 -> ${ch}`)
+        client.publish({ destination: '/app/sailDecision', body: JSON.stringify({ clientId, choice: ch }) })
+      } else if (voy.offered) {
         client.publish({ destination: '/app/sailDecision', body: JSON.stringify({ clientId, choice: 'continue' }) })
       } else {
         if (clicks % 10 === 0) console.log(`   [${clicks}] ${Math.round(voy.traveledKm)}km 天气=${weatherCur} 距最近港=${Math.round(minPortKm(voy.lat, voy.lng))}km`)
+        clicks++
         client.publish({ destination: '/app/sail', body: JSON.stringify({ clientId }) })
       }
     })

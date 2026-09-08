@@ -13,7 +13,7 @@ const RELOGIN_AT = 30
 let phase = 'init'
 let clicks = 0
 let goldPrev = null
-let seen = new Set()
+let occPrev = new Map()
 let relogined = false
 
 function fail(msg) {
@@ -23,14 +23,18 @@ function fail(msg) {
 }
 
 function newBankLines(voy) {
-  // 只统计“本轮新出现”的 ✨ 行（seaLog 会保留历史，必须按首次出现去重）
-  const out = []
+  // 只统计“本轮新增出现”的 ✨ 行。同一文本事件可能合法地重复出现（如两次“金币+13（沉船宝藏）”），
+  // 因此按“该文本在本次状态里的出现次数 − 上次状态里的出现次数”计数，而不是按文本去重。
+  const occ = new Map()
   for (const l of voy.seaLog || []) {
-    if (!seen.has(l)) {
-      seen.add(l)
-      if (l.includes('✨')) out.push(l)
-    }
+    if (l.includes('✨')) occ.set(l, (occ.get(l) || 0) + 1)
   }
+  const out = []
+  for (const [txt, n] of occ) {
+    const before = occPrev.get(txt) || 0
+    for (let k = 0; k < Math.max(0, n - before); k++) out.push(txt)
+  }
+  occPrev = occ
   return out
 }
 
