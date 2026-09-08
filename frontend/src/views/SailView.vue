@@ -94,19 +94,23 @@ function goMarket() {
       </p>
 
       <div class="sailrow">
-        <button
-          class="sailbtn"
-          :class="{ warn: game.voyage.weatherWarned }"
-          :disabled="!!game.voyage.offered"
-          @click="doSail"
-        >{{ game.voyage.departed ? '⛵ 前进 10 公里' : (game.voyage.weatherWarned ? '⛈ 仍要启航！' : '⛵ 出发！前进 10 公里') }}</button>
-        <button
-          v-if="game.voyage.departed"
-          class="backbtn"
-          :disabled="!!game.voyage.offered"
-          @click="goBack"
-        >⏪ 后退 10 公里</button>
-        <button class="rtnbtn" @click="choose('return')">↩ {{ game.voyage.departed ? '返回出发港' : '返回（取消航线）' }}</button>
+        <div class="side left">
+          <button
+            v-if="game.voyage.departed"
+            class="backbtn"
+            :disabled="!!game.voyage.offered"
+            @click="goBack"
+          >⏪ 后退 10 公里</button>
+          <button v-else class="rtnbtn" :disabled="!!game.voyage.offered" @click="choose('return')">↩ 返回（取消航线）</button>
+        </div>
+        <div class="side right">
+          <button
+            class="sailbtn"
+            :class="{ warn: game.voyage.weatherWarned }"
+            :disabled="!!game.voyage.offered"
+            @click="doSail"
+          >{{ game.voyage.departed ? '⛵ 前进 10 公里' : (game.voyage.weatherWarned ? '⛈ 仍要启航！' : '⛵ 出发！前进 10 公里') }}</button>
+        </div>
       </div>
 
       <!-- 途经地：两个菜单 -->
@@ -131,7 +135,8 @@ function goMarket() {
   .stats { margin:8px 0; font-size:14px; }
   .bar { height:8px; background:#1c2742; border-radius:4px; overflow:hidden; margin:6px 0 10px; }
   .fill { height:100%; background:#34507f; transition:width .3s; }
-  .sailrow { text-align:center; margin:10px 0; }
+  .sailrow { display:flex; justify-content:space-between; align-items:center; margin:10px 0; }
+  .sailrow .side { display:flex; }
   .sailbtn { padding:12px 24px; font-size:16px; font-weight:bold; background:#1c3a5a; }
   .backbtn { padding:12px 18px; font-size:15px; background:#3a2a1c; }
   .rtnbtn { padding:12px 18px; font-size:15px; background:#241c18; }
