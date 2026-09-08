@@ -11,7 +11,9 @@ import com.ageofvoyages.model.Player;
 import com.ageofvoyages.model.PlayerEntity;
 import com.ageofvoyages.model.Port;
 import com.ageofvoyages.model.Voyage;
+import com.ageofvoyages.model.SeafareEventEntity;
 import com.ageofvoyages.repository.PlayerMapper;
+import com.ageofvoyages.repository.SeafareConfigMapper;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
@@ -35,19 +37,55 @@ public class GameService {
     private static final double IMPACT_THRESHOLD = 0.06;
 
     // ---------- 航行参数（手动模式） ----------
-    /** 每次点击「航行」前进的公里数 */
-    private static final double KM_PER_CLICK = 10;
+    /** 每次点击「航行」前进的公里数是一个 40~120 的随机区间，会随天气/海况合理分布（见 stepKm） */
     /** 距当前航位多近的其它港口会被视为「途经地」（可进港 / 继续） */
     private static final double PASSING_RADIUS_KM = 220;
+
+    // ---------- 天气：缓慢演变，绝不跨级突变 ----------
+    // 严重度阶梯：晴空万里(0) → 多云(1) → 阴雨(2) → {狂风大作, 下雷雨}(3)
+    // 每次演变只在“相邻天气”之间移动，所以从「晴空万里」绝不可能一步跳到「下雷雨」。
+    private static final Map<String, List<String>> WEATHER_NEXT = Map.of(
+            "晴空万里", List.of("晴空万里", "多云"),
+            "多云",     List.of("晴空万里", "多云", "阴雨"),
+            "阴雨",     List.of("多云", "阴雨", "狂风大作", "下雷雨"),
+            "狂风大作", List.of("阴雨", "狂风大作", "下雷雨"),
+            "下雷雨",   List.of("阴雨", "狂风大作", "下雷雨")
+    );
+    private static final Map<String, String> WEATHER_HELP = Map.of(
+            "晴空万里", "风和日丽，宜扬帆远航",
+            "多云",     "云影舒卷，海面平稳",
+            "阴雨",     "细雨绵绵，注意保暖",
+            "狂风大作", "狂风呼啸，舵手须谨慎",
+            "下雷雨",   "电闪雷鸣，谨防落雷劈船"
+    );
     /** 距任何港口超过该公里数才算“海中间”——海盗、雷击等坏事件只发生在真正的大洋上 */
     private static final double DEEP_SEA_KM = 150;
-    /** 全程超过该公里数的长途（跨海/跨洲）航线，才可能遭遇海盗、雷击等坏事件 */
-    private static final double LONG_HAUL_KM = 1500;
     /** 地球半径（公里），用于大圆距离 / 航线插值 */
     private static final double EARTH_R = 6371.0;
 
     private final SimpMessagingTemplate tmpl;
     private final PlayerMapper repo;
+    private final SeafareConfigMapper cfgRepo;
+
+    // ---------- 海上遭遇（配置在 seafare_event 表，一行一个事件，改库即时生效；以下为表缺行时的兜底值） ----------
+    private record SeafareRow(double perKm, String seaReq, double minStartKm, double minSpacingKm,
+                              int maxPerVoyage, double minVoyageKm) {}
+
+    /** 每次航行点击从数据库读配置（改库即时生效）；少的行用代码兜底值补齐 */
+    private Map<String, SeafareRow> seafareRows() {
+        Map<String, SeafareRow> m = new HashMap<>();
+        for (SeafareEventEntity e : cfgRepo.findAll()) {
+            m.put(e.eventCode, new SeafareRow(e.perKm, e.seaReq == null ? "any" : e.seaReq,
+                    e.minStartKm, e.minSpacingKm, e.maxPerVoyage, e.minVoyageKm));
+        }
+        // 兜底默认：漂流瓶 600km 最多1瓶/前100km不出现/全程≤5；彩蛋 300km 间隔/全程≤10；
+        // 海盗 1000km 间隔/全程≤2；雷击 全程只1次且航线≥3000km
+        m.putIfAbsent("bottle",    new SeafareRow(0.0017, "any",   100,  600, 5,  0));
+        m.putIfAbsent("ambient",   new SeafareRow(0.002,  "any",   0,    300, 10, 0));
+        m.putIfAbsent("pirate",    new SeafareRow(0.0015, "ocean", 0,    1000, 2, 0));
+        m.putIfAbsent("lightning", new SeafareRow(0.001,  "ocean", 0,    150, 1,  3000));
+        return m;
+    }
 
     // ---------- 世界地图（一级：海域 / 二级：港口，带真实经纬度） ----------
     private record Region(String id, String name) {}
@@ -57,6 +95,13 @@ public class GameService {
             new Region("mediterranean", "地中海"),
             new Region("indian", "印度洋 · 南洋"),
             new Region("asia", "亚洲 · 远东")
+    );
+    /** 海域的“大洋短名”（航行中「当前海域」展示用） */
+    private static final Map<String, String> SEA_NAMES = Map.of(
+            "north-sea", "北海",
+            "mediterranean", "地中海",
+            "indian", "印度洋",
+            "asia", "远东"
     );
     private final List<Port> PORTS = List.of(
             new Port("london", "伦敦", "north-sea", 51.5074, -0.1278),
@@ -86,6 +131,15 @@ public class GameService {
     private final Map<String, Port> portMap = PORTS.stream().collect(Collectors.toMap(Port::id, p -> p));
     private final Map<String, Good> goodMap = GOODS.stream().collect(Collectors.toMap(Good::id, g -> g));
 
+    /** 商品的「主产地海域」：在主产地便宜、跨大区贵——这是「跑商赚钱」闭环的根基 */
+    private static final Map<String, String> GOOD_HOME_REGION = Map.of(
+            "tea", "asia",
+            "spice", "indian",
+            "wine", "mediterranean"
+    );
+    /** 「东半球」：indian + asia；其余（north-sea、mediterranean）属「西半球」 */
+    private static final Set<String> EAST_HEMISPHERE = Set.of("indian", "asia");
+
     /** 行情：portId -> (goodId -> MarketItem) */
     private final Map<String, Map<String, MarketItem>> market = new ConcurrentHashMap<>();
     /** 在线玩家（实时状态，内存）：clientId -> Player */
@@ -93,9 +147,10 @@ public class GameService {
     /** 每位玩家的组合式叙事器：保证同一玩家反复遭遇同一事件时，描述与内心OS尽量不重样 */
     private final Map<String, Narrator> narrators = new ConcurrentHashMap<>();
 
-    public GameService(SimpMessagingTemplate tmpl, PlayerMapper repo) {
+    public GameService(SimpMessagingTemplate tmpl, PlayerMapper repo, SeafareConfigMapper cfgRepo) {
         this.tmpl = tmpl;
         this.repo = repo;
+        this.cfgRepo = cfgRepo;
     }
 
     private Narrator narrator(String clientId) {
@@ -122,19 +177,46 @@ public class GameService {
                 it.base = g.base();
                 it.drift = (Math.random() * 2 - 1) * g.range();
                 it.stock *= (1 - REVERT);
-                recalc(it);
+                recalc(p.id(), g.id(), it);
             }
         }
         for (String cid : players.keySet()) sendState(cid);
     }
 
-    /** 最终价 = 基准价 ×(1+时间波动) ×(1+供需影响)；tanh 保证平滑饱和 */
-    private void recalc(MarketItem it) {
-        double eff = it.base * (1 + it.drift);
-        double mult = 1 + MAX_DEV * Math.tanh(-it.stock / SCALE); // stock 为负(被买走)→涨价
-        it.buy = Math.max(1, (int) Math.round(eff * mult));
+    /** 最终价 = 基准价 × 港口乘数 ×(1+时间波动) ×(1+供需影响)；tanh 保证平滑饱和。
+     *  港口乘数让「主产地便宜 / 远港贵」，是跑商赚钱的根基。 */
+    private void recalc(String portId, String goodId, MarketItem it) {
+        double mult = priceMult(portId, goodId);
+        double eff = it.base * mult * (1 + it.drift);
+        double stockMult = 1 + MAX_DEV * Math.tanh(-it.stock / SCALE); // stock 为负(被买走)→涨价
+        it.buy = Math.max(1, (int) Math.round(eff * stockMult));
         it.sell = Math.max(1, (int) Math.round(it.buy * 0.9));
         it.trend = (int) Math.round((it.buy / (double) it.base - 1) * 100);
+    }
+
+    /** 港口对某商品的基准价乘数：主产地 0.55~0.72、同半球相邻 0.95~1.15、跨大区 1.65~1.95。
+     *  同海域内不同港口有稳定的小抖动，避免同区价格完全一致。 */
+    private double priceMult(String portId, String goodId) {
+        Port p = portMap.get(portId);
+        if (p == null) return 1.0;
+        String portRegion = p.regionId();
+        String home = GOOD_HOME_REGION.getOrDefault(goodId, "north-sea");
+        double jitter = portJitter(portId, goodId);
+        if (portRegion.equals(home)) {
+            return 0.55 + 0.17 * jitter;            // 主产地，便宜
+        }
+        boolean portEast = EAST_HEMISPHERE.contains(portRegion);
+        boolean homeEast = EAST_HEMISPHERE.contains(home);
+        if (portEast == homeEast) {
+            return 0.95 + 0.20 * jitter;            // 同半球相邻，平价
+        }
+        return 1.65 + 0.30 * jitter;                // 跨大区，贵
+    }
+
+    /** 稳定的 [0,1) 抖动，让同海域不同港口的同种货物有差异 */
+    private double portJitter(String portId, String goodId) {
+        int h = Math.abs((portId + ":" + goodId).hashCode());
+        return (h % 1000) / 1000.0;
     }
 
     // ---------- 指令 ----------
@@ -177,7 +259,6 @@ public class GameService {
         if (dest.id().equals(p.port)) { sendMsg(r.clientId(), "您已在该港"); return; }
 
         double total = havKm(from.lat(), from.lng(), dest.lat(), dest.lng());
-        int clicks = (int) Math.ceil(total / KM_PER_CLICK);
 
         Voyage v = new Voyage();
         v.fromId = p.port;
@@ -187,8 +268,9 @@ public class GameService {
         v.lat = from.lat();
         v.lng = from.lng();
         v.departed = false;
-        v.seaLog.add("🗺 航线已规划：由 " + from.name() + " 前往 " + dest.name()
-                + "，全程 " + (int) Math.round(total) + " 公里，约需 " + clicks + " 次航行。点击「出发」启程！");
+        addLog(v,"🗺 航线已规划：由 " + from.name() + " 前往 " + dest.name()
+                + "，全程约 " + (int) Math.round(total) + " 公里。点击「出发」启程！"
+                + "（每次航行的里程随天气海况浮动，途中可用「天气占卜」预知前景）");
         p.voyage = v;
         p.traveling = true;
         p.travelingTo = dest.id();
@@ -203,6 +285,10 @@ public class GameService {
         if (p == null) return;
         Voyage v = p.voyage;
         if (v == null) { sendMsg(r.clientId(), "当前未在航行"); return; }
+        if (v.pendCombat) {
+            sendMsg(r.clientId(), "海盗就横在船头，先拿个主意：迎战 / 甩开 / 花钱消灾");
+            return;
+        }
         if (v.offeredId != null) {
             sendMsg(r.clientId(), "前方正在经过 " + portName(v.offeredId) + "，请选择「进港」或「继续航行」");
             return;
@@ -218,12 +304,13 @@ public class GameService {
         if (back) {
             // 掉头后退：回到出发港即航程结束；途中靠近的港仍可进港
             if (!v.departed) { sendMsg(r.clientId(), "还未出发，无需后退"); return; }
-            double step = Math.min(KM_PER_CLICK, v.traveledKm);
+            double step = Math.min(stepKm(p.weather), v.traveledKm);
             double brng = bearingDeg(v.lat, v.lng, from.lat(), from.lng());
             double[] np = destPoint(v.lat, v.lng, brng, step);
             v.lat = np[0];
             v.lng = np[1];
             v.traveledKm = Math.max(0, v.traveledKm - step);
+            seaOf(v);
 
             // 后退时离某个「已略过」的港越来越远，就把它重新解锁，之后再次靠近可重新选择
             for (String pid : List.copyOf(v.passed)) {
@@ -233,57 +320,61 @@ public class GameService {
             }
 
             if (v.traveledKm <= 1e-9) {
-                v.seaLog.add("🔄 你掉头返航，重新靠上 " + from.name() + " 的码头。");
+                addLog(v,"🔄 你掉头返航，重新靠上 " + from.name() + " 的码头。");
                 arriveAt(p, r.clientId(), v, from.id(), "返航回到出发港 " + from.name() + "（全程未走完）");
                 return;
             }
-            v.seaLog.add("⏪ 后退 10 公里，已航行 " + (int) Math.round(v.traveledKm) + "/" + (int) Math.round(v.totalKm) + " 公里");
+            addLog(v,"⏪ 后退 " + (int) Math.round(step) + " 公里，距目的地还有 " + (int) Math.round(v.totalKm - v.traveledKm) + " 公里");
             trim(v.seaLog);
             detectWaypoint(v, prevLat, prevLng);
             sendState(r.clientId());
             return;
         }
 
-        // 前进（首次点击确认「出发」：若当时海况恶劣，先提醒一次，不真正开船）
+        // 前进（首次点击＝启航出发）：出发前若海况恶劣，先提醒一次，不真正开船
+        String beforeWeather = p.weather;                 // 本次点击前的天气（用于判断是否“变天”）
         boolean justDeparted = !v.departed;
+        // 天气每击缓慢渐变（12% 概率，只走相邻天气，绝不变天跳级）：长航线途中也会遇到风暴，
+        // 雷击这类“大洋深处”的坏事件才不会永远可望而不可即
+        String weather = driftWeather(p);
         if (justDeparted) {
-            String w0 = driftWeather(p);
-            if (isExtreme(w0) && !v.weatherWarned) {
+            if (isExtreme(weather) && !v.weatherWarned) {
                 v.weatherWarned = true;
-                v.seaLog.add("⚠️ 港外海况恶劣（" + w0 + "），现在出航太危险！若执意要开船，请再按一次「出发」；想改期就点「返回」留在港里。");
+                addLog(v,"⚠️ 港外海况恶劣（" + weather + "），现在出航太危险！若执意要开船，请再按一次「出发」；想改期就点「返回」留在港里。");
                 trim(v.seaLog);
                 sendState(r.clientId());
                 return;
             }
+            // 出发前一刻也漂移一次：好让玩家在码头时能有“阴到晴/晴到阴”的自然变化
         }
         v.departed = true;
-        double step = Math.min(KM_PER_CLICK, v.totalKm - v.traveledKm);
+
+        if (beforeWeather != null && !beforeWeather.equals(weather)) {
+            addLog(v,weatherShift(r.clientId(), beforeWeather, weather));
+        }
+
+        double step = Math.min(stepKm(weather), v.totalKm - v.traveledKm);
         double brng = bearingDeg(v.lat, v.lng, dest.lat(), dest.lng());
         double[] np = destPoint(v.lat, v.lng, brng, step);
         v.lat = np[0];
         v.lng = np[1];
         v.traveledKm += step;
+        seaOf(v);
 
-        if (justDeparted) v.seaLog.add("⛵ 拔锚启航！船头劈开浪花，驶向 " + dest.name());
+        if (justDeparted) addLog(v,"⛵ 拔锚启航！船头劈开浪花，驶向 " + dest.name());
 
         if (v.traveledKm >= v.totalKm - 1e-9) {
-            v.seaLog.add("🏝 抵达 " + dest.name() + "港！航程结束。");
+            addLog(v,"🏝 抵达 " + dest.name() + "港！航程结束。");
             arriveAt(p, r.clientId(), v, dest.id(), "🏝 历经 " + (int) Math.round(v.traveledKm) + " 公里航行，抵达 " + dest.name() + "港");
             broadcast("🏝 船长 [" + p.name + "] 历经" + (int) Math.round(v.traveledKm) + "公里航行，抵达 " + dest.name() + "港");
             return;
         }
 
-        // 天气是慢慢变的（沿用上一次航行时就开始的天气），偶尔才渐变一次，不会每次点击都变天
-        String oldWeather = p.weather;
-        String weather = driftWeather(p);
-        if (oldWeather != null && !oldWeather.equals(weather)) {
-            v.seaLog.add(weatherShift(r.clientId(), oldWeather, weather));
-        }
-        v.seaLog.add(seaReport(v, weather));                          // 数字进度（稳定，供 UI/测试解析）
-        v.seaLog.add(weatherMood(r.clientId(), weather));             // 天气连着心情：好天开心，坏天忐忑
-        if (Math.random() < 0.30) v.seaLog.add(ambientEvent(r.clientId(), weather)); // 海上小彩蛋
-        rollSeaEvents(p, r.clientId(), v, weather);                   // 大事件：漂流瓶(远近都有) / 海盗·雷击(只在大洋长途)
-        persist(p, r.clientId());                                     // 事件增减的金币/货物立即入库，刷新或重连不会丢
+        addLog(v,seaReport(v, weather));                       // 当前状态：距目的地剩余公里 + 天气 + 海面
+        addLog(v,weatherMood(r.clientId(), weather, v));        // 天气连着心情（同时写入 v.mood 供界面显示）
+        v.event = "🌤 航行中，海面暂无异常";
+        rollSeaEvent(p, r.clientId(), v, weather, step);           // 最多一个遭遇：漂流瓶/彩蛋/海盗/雷击
+        persist(p, r.clientId());                                  // 事件增减的金币/货物立即入库，刷新或重连不会丢
 
         // 检测前方途经地
         detectWaypoint(v, prevLat, prevLng);
@@ -313,13 +404,99 @@ public class GameService {
         if (v == null) { sendMsg(r.clientId(), "当前没有进行中的航程"); return; }
 
         String pid = v.offeredId;
-        if ("return".equals(r.choice())) {
+        if ("return".equals(r.choice()) && !v.pendCombat) {
             boolean preDepart = !v.departed;
             String backPort = v.fromId;
-            v.seaLog.add("↩ " + (preDepart ? "你收起航海图，放弃了这条航线。" : "你调转船头，掉头回航。"));
+            addLog(v,"↩ " + (preDepart ? "你收起航海图，放弃了这条航线。" : "你调转船头，掉头回航。"));
             arriveAt(p, r.clientId(), v, backPort,
                     preDepart ? "已取消航线，留在 " + portName(backPort) + "港" : "返回出发港 " + portName(backPort));
             broadcast("↩ 船长 [" + p.name + "] " + (preDepart ? "取消了" + portName(v.destId) + "的航线" : "中途返回了 " + portName(backPort) + "港"));
+            return;
+        }
+
+        // 海盗对峙：玩家在「迎战 / 甩开 / 花钱消灾」中三选一
+        if (v.pendCombat) {
+            Narrator n = narrator(r.clientId());
+            String c = r.choice();
+            List<String> lines = new ArrayList<>();
+            if ("fight".equals(c)) {
+                boolean win = Math.random() < 0.5;
+                if (win) {
+                    int loot = 5 + (int) (Math.random() * 11);    // 5~15 金币
+                    p.gold += loot;
+                    lines.add("⚔️ 你拔刀迎战！混战中砍翻了一片，海盗头子一看风向不对，扔下赃物扬帆跑了。");
+                    lines.add("💰 从海盗赃物里翻出 " + loot + " 金币！");
+                    lines.add("（内心OS：*" + n.slot("pirWinOs",
+                            "嘿，爷爷的刀还没老！这帮孙子下次再撞上就没这么好运了！",
+                            "痛快！这才叫跑海的人该有的样子！今晚必须开两瓶好酒！",
+                            "我擦刀上的血，心里那股憋屈总算散了一半。")
+                            + "*）");
+                } else {
+                    int used = p.cargo.values().stream().mapToInt(Integer::intValue).sum();
+                    if (used > 0) {
+                        int take = 1 + (int) (Math.random() * 3); // 1~3 件
+                        int left = Math.min(take, used);
+                        List<String> lostDesc = new ArrayList<>();
+                        // 用 keySet 快照遍历：下面会 remove/put，直接迭代 entrySet 会抛 ConcurrentModificationException
+                        for (String key : List.copyOf(p.cargo.keySet())) {
+                            if (left <= 0) break;
+                            int have = p.cargo.getOrDefault(key, 0);
+                            int x = Math.min(have, left);
+                            if (x <= 0) continue;
+                            int remain = have - x;
+                            if (remain <= 0) p.cargo.remove(key); else p.cargo.put(key, remain);
+                            lostDesc.add(goodName(key) + "×" + x);
+                            left -= x;
+                        }
+                        lines.add("⚔️ 你拔刀迎战！可他们人多势众，你被打翻在地，舱门被砸开。");
+                        lines.add("📦 货物被抢走 " + String.join("、", lostDesc) + "！");
+                    } else {
+                        lines.add("⚔️ 你拔刀迎战！可他们人多势众，你被打翻在地。");
+                        lines.add("　好在舱里空空，他们翻了个寂寞，骂骂咧咧撤了。");
+                    }
+                    lines.add("（内心OS：*" + n.slot("pirLoseOs",
+                            "刀都卷了刃……这仇我记下了，下回非得装两门炮再走这条道！",
+                            "人在舱檐下，不得不低头。可这口气，我是真咽不下去……",
+                            "我盯着他们离去的船影，把每个刺青都刻进了脑子里。",
+                            "呜……这趟本钱赔了大半，心都在滴血！")
+                            + "*）");
+                }
+            } else if ("flee".equals(c)) {
+                int lost = 80 + (int) (Math.random() * 71);        // 倒退 80~150 公里
+                lost = Math.min(lost, (int) Math.round(v.traveledKm));
+                v.traveledKm = Math.max(0, v.traveledKm - lost);
+                lines.add("🏃 你扯满帆、调转船头，趁乱甩开了追兵。");
+                lines.add("⏪ 可惜被追回了 " + lost + " 公里——海盗对这片海域熟得很。");
+                lines.add("（内心OS：*" + n.slot("pirFleeOs",
+                        "好汉不吃眼前亏，先保住货要紧。这口气……来日方长！",
+                        "跑得心跳都到嗓子眼了……这风救了我一命啊。",
+                        "等我回港就去找那帮老水手问问，这片海盗是哪路神仙，回头一定找回场子。")
+                        + "*）");
+            } else if ("pay".equals(c)) {
+                int toll = 5;
+                if (p.gold < toll) {
+                    sendMsg(r.clientId(), "你身上凑不够 5 金币，海盗嫌你没油水，骂骂咧咧不肯走。赶紧选「迎战」或「甩开」！");
+                    return;
+                }
+                p.gold -= toll;
+                lines.add("💰 你忍气吞声，乖乖交出 " + toll + " 金币。海盗掂了掂成色，撇撇嘴挥手放你走了。");
+                lines.add("（内心OS：*" + n.slot("pirPayOs",
+                        "花钱消灾，花钱消灾……我数着空钱袋，拼命劝自己冷静。",
+                        "人在屋檐下，不得不低头。这笔账……记着吧。",
+                        "呸！等我发了财，第一件事就是雇条炮船来收拾你们！")
+                        + "*）");
+            } else {
+                sendMsg(r.clientId(), "海盗正等着你拿主意：迎战 / 甩开 / 花钱消灾");
+                return;
+            }
+            v.pendCombat = false;
+            addAllLog(v, lines);
+            v.eventDetail = List.copyOf(lines);
+            // 注意：lastPirateKm 已在触发时记过，此处不覆盖——否则「甩开」后退后很快又会被海盗拦一次
+            trim(v.seaLog);
+            tmpl.convertAndSend("/topic/player/" + r.clientId() + "/voyageLog", Map.of("lines", List.copyOf(v.seaLog)));
+            persist(p, r.clientId());
+            sendState(r.clientId());
             return;
         }
 
@@ -337,7 +514,7 @@ public class GameService {
         } else {
             v.passed.add(pid);
             v.offeredId = null;
-            v.seaLog.add("🚢 略过 " + portName(pid) + "，继续向目的地航行");
+            addLog(v,"🚢 略过 " + portName(pid) + "，继续向目的地航行");
             trim(v.seaLog);
             sendState(r.clientId());
             sendMsg(r.clientId(), "继续向前航行");
@@ -381,7 +558,7 @@ public class GameService {
             return;
         }
 
-        recalc(item);
+        recalc(p.port, r.item(), item);
         double change = (item.buy - priceBefore) / (double) priceBefore;
         persist(p, r.clientId());
 
@@ -438,32 +615,39 @@ public class GameService {
         return new double[]{Math.toDegrees(phi2), Math.toDegrees(lon2)};
     }
 
-    /** 随机今天的天气（事件叙述按天气联动） */
-    private static String randomWeather() {
-        String[] weather = {"晴空万里", "多云", "阴雨", "下雷雨", "狂风大作"};
-        return weather[(int) (Math.random() * weather.length)];
-    }
-
-    /** 每次点击的海况报告：只报数字进度与天气/海面等「事实」，供 UI 与测试稳定解析（叙事由 weatherMood 等承担） */
+    /** 当前航况报告：只报「距目的地还有多少公里」+ 天气 + 海面（不再显示“已航行 / 还需 N 次”） */
     private String seaReport(Voyage v, String weather) {
         String[] sea = {"风平浪静", "微波荡漾", "小浪翻涌", "大浪起伏", "巨浪滔天"};
         String s = sea[(int) (Math.random() * sea.length)];
         boolean thunder = "下雷雨".equals(weather);
-        int remain = Math.max(0, (int) Math.ceil((v.totalKm - v.traveledKm) / KM_PER_CLICK));
-        return "🌊 已航行 " + (int) Math.round(v.traveledKm) + " / " + (int) Math.round(v.totalKm)
-                + " 公里（还需 " + remain + " 次） ｜ 天气：" + weather + " ｜ 海面：" + s
+        int remain = Math.max(0, (int) Math.round(v.totalKm - v.traveledKm));
+        return "🌊 距目的地还有 " + remain + " 公里 ｜ 海域：" + seaOf(v) + " ｜ 天气：" + weather + " ｜ 海面：" + s
                 + " ｜ 雷雨：" + (thunder ? "🌩 电闪雷鸣" : "无");
     }
 
-    /** 天气沿用上一次点击的，偶尔（约 7%）才渐变一次 —— 不会每次点击都换一种天 */
+    /** 天气缓慢演变：约 88% 维持不变；要变也只在「相邻天气」之间移动
+     *  （晴空万里→多云→阴雨→狂风大作/下雷雨），绝不跨级突变（晴空不可能一步跳到雷电）。 */
     private String driftWeather(Player p) {
-        if (p.weather == null) return p.weather = randomWeather();
-        if (Math.random() < 0.07) {
-            List<String> pool = new ArrayList<>(List.of("晴空万里", "多云", "阴雨", "下雷雨", "狂风大作"));
-            pool.remove(p.weather);
-            p.weather = pool.get((int) (Math.random() * pool.size()));
+        if (p.weather == null) return p.weather = "晴空万里";
+        if (Math.random() < 0.12) {
+            List<String> next = WEATHER_NEXT.get(p.weather);
+            if (next != null) p.weather = next.get((int) (Math.random() * next.size()));
         }
         return p.weather;
+    }
+
+    /** 本次「航行」前进的公里数：落在 40~120 的随机区间，但随天气/海况合理分布
+     *  ——好天气扬帆快，风暴里寸步难行；区间上下界都落在 [40,120]，结果自然不出界。 */
+    private double stepKm(String weather) {
+        double lo, hi;
+        switch (weather == null ? "" : weather) {
+            case "晴空万里" -> { lo = 75;  hi = 120; }
+            case "多云"     -> { lo = 60;  hi = 120; }
+            case "阴雨"     -> { lo = 45;  hi = 100; }
+            case "狂风大作", "下雷雨" -> { lo = 40; hi = 85; }
+            default        -> { lo = 50;  hi = 110; }
+        }
+        return lo + Math.random() * (hi - lo);
     }
 
     /** 是否算“恶劣海况”（出发前会就这种情况先询问是否真的要开船） */
@@ -478,6 +662,20 @@ public class GameService {
             best = Math.min(best, havKm(v.lat, v.lng, po.lat(), po.lng()));
         }
         return best;
+    }
+
+    /** 当前所在海域：按最近的港口归属到某个大洋（北海/地中海/印度洋/远东），离任何港口≥DEEP_SEA_KM 视为「大洋深处」。
+     *  写入 v.seaName（如“印度洋 · 大洋深处”），返回供海况报告拼接。坏事件（海盗/雷击）只在“大洋深处”发生。 */
+    private String seaOf(Voyage v) {
+        Port near = null;
+        double best = Double.MAX_VALUE;
+        for (Port po : PORTS) {
+            double d = havKm(v.lat, v.lng, po.lat(), po.lng());
+            if (d < best) { best = d; near = po; }
+        }
+        String sea = near == null ? "远洋" : SEA_NAMES.getOrDefault(near.regionId(), near.regionId());
+        v.seaName = best >= DEEP_SEA_KM ? sea + " · 大洋深处" : sea + " · 近海";
+        return v.seaName;
     }
 
     // ---------- 航行遭遇（RPG 叙述：组合式词池，场景 + 事件 + 内心OS，喜怒哀乐俱全） ----------
@@ -541,33 +739,90 @@ public class GameService {
         };
     }
 
-    /** 每个前进航次掷随机遭遇：
-     *  漂流瓶：近海、远海都可能碰到（正儿八经的小惊喜）；
-     *  海盗 / 雷击：只在真正的大洋深处、且是长途（跨海/跨洲）航线里才会发生——
-     *       刚出港的近海绝不会遇到，且每 300 公里以内最多打劫一次。 */
-    private void rollSeaEvents(Player p, String clientId, Voyage v, String weather) {
-        // 漂流瓶：顺流漂来的惊喜，不分远近
-        if (Math.random() < 0.08) bottleEvent(p, clientId, v);
+    /** 每个前进航次最多掷出【一个】事件（互斥，避免“漂流瓶+海盗”挤在同一击里）：
+     *  各类事件的参数存 seafare_event 表（每公里概率 × 本次推进公里数 得本击触发概率）：
+     *    - 漂流瓶：走出一段路（min_start_km，如 100km）后才会捞到；600 公里内最多一次；全程≤5
+     *    - 彩蛋（飞鱼/海豚/海鸟…）：海上小插曲，300 公里内最多一次；全程≤10
+     *    - 海盗：sea_req=ocean 只在大洋深处（离任何港口 ≥150km）；1000 公里内最多一次；全程≤2
+     *    - 雷击：sea_req=ocean + 雷雨天；航线 ≥3000km 才会遇到；全程只 1 次 */
+    private void rollSeaEvent(Player p, String clientId, Voyage v, String weather, double step) {
+        Map<String, SeafareRow> cfg = seafareRows();
+        boolean deepSea = minPortKm(v) >= DEEP_SEA_KM;   // 海中间（远离一切港口）
 
-        boolean deepSea = minPortKm(v) >= DEEP_SEA_KM;           // 海中间（远离一切港口）
-        boolean longHaul = v.totalKm >= LONG_HAUL_KM;             // 长途航线（跨海/跨洲）
+        SeafareRow bottle = cfg.get("bottle");
+        // 用“本次推进前”的里程判断：保证整段都开过 min_start_km 后才可能捞到（开局大步一脚也不会第一击就白捡）
+        boolean bottleOk = bottle != null
+                && v.traveledKm - step >= bottle.minStartKm()                    // 走过一段路才出现
+                && v.traveledKm - v.lastBottleKm >= bottle.minSpacingKm()         // 600 公里内最多一次
+                && v.bottleCount < bottle.maxPerVoyage;                           // 全程最多 5 次
+        double bottleP = bottleOk ? bottle.perKm() * step : 0;
 
-        // 海盗：大洋深处的老客户，每 300 公里最多一笔
-        if (deepSea && longHaul && v.traveledKm - v.lastPirateKm >= 300 && Math.random() < 0.15) {
+        SeafareRow ambient = cfg.get("ambient");
+        boolean ambientOk = ambient != null
+                && v.traveledKm - v.lastAmbientKm >= ambient.minSpacingKm()       // 300 公里内最多一次
+                && v.ambientCount < ambient.maxPerVoyage;                         // 全程最多 10 次
+        double ambientP = ambientOk ? ambient.perKm() * step : 0;
+
+        SeafareRow pirate = cfg.get("pirate");
+        boolean pirateOk = pirate != null && "ocean".equals(pirate.seaReq()) && deepSea
+                && v.traveledKm - v.lastPirateKm >= pirate.minSpacingKm()         // 1000 公里内最多一次
+                && v.pirateCount < pirate.maxPerVoyage;                           // 全程最多 2 次
+        double pirateP = pirateOk ? pirate.perKm() * step : 0;
+
+        SeafareRow lightning = cfg.get("lightning");
+        boolean lightOk = lightning != null && "ocean".equals(lightning.seaReq()) && "下雷雨".equals(weather) && deepSea
+                && v.traveledKm - v.lastLightningKm >= lightning.minSpacingKm()
+                && v.lightningCount < lightning.maxPerVoyage                      // 全程只 1 次
+                && v.totalKm >= lightning.minVoyageKm();                          // 航线 ≥3000km 才会遇到
+        double lightP = lightOk ? lightning.perKm() * step : 0;
+
+        double cumBottle = bottleP + pirateP + lightP + ambientP;
+        if (cumBottle <= 0 || Math.random() >= Math.min(1.0, cumBottle)) return;
+
+        double r = Math.random() * cumBottle;
+        if (r < pirateP) {
             pirateEvent(p, clientId, v);
             v.lastPirateKm = v.traveledKm;
-        }
-
-        // 雷击：雷雨天 + 大洋深处才可能劈到船，且与上一次拉开距离
-        if ("下雷雨".equals(weather) && deepSea && longHaul
-                && v.traveledKm - v.lastLightningKm >= 200 && Math.random() < 0.12) {
+            v.pirateCount++;
+            v.event = "🏴 海盗来袭！";
+        } else if (r < pirateP + lightP) {
             lightningEvent(p, clientId, v);
             v.lastLightningKm = v.traveledKm;
+            v.lightningCount++;
+            v.event = "⚡ 遭遇雷击，货舱受损！";
+        } else if (r < pirateP + lightP + bottleP) {
+            bottleEvent(p, clientId, v);
+            v.lastBottleKm = v.traveledKm;
+            v.bottleCount++;
+            v.event = "💰 捡到一只漂流瓶";
+        } else {
+            addLog(v,ambientEvent(clientId, weather));
+            v.lastAmbientKm = v.traveledKm;
+            v.ambientCount++;
+            v.event = "🌊 海上见了些妙趣";
         }
     }
 
-    /** 天气连着心情：晴好多云则心情大好、哼两句船歌；坏天气则心里打鼓，怕有什么不测 */
-    private String weatherMood(String clientId, String weather) {
+    /** 天气占卜：预报未来 3 天海况（只模拟演变、不改写真实天气），推给专属 topic 由前端弹窗展示。 */
+    public void forecast(String clientId) {
+        Player p = players.get(clientId);
+        if (p == null) return;
+        if (p.voyage == null) { sendMsg(clientId, "只有航行途中才能占卜天气"); return; }
+        String w = (p.weather == null) ? "晴空万里" : p.weather;
+        List<Map<String, String>> days = new ArrayList<>();
+        for (int d = 1; d <= 3; d++) {
+            List<String> next = WEATHER_NEXT.get(w);
+            if (next == null) w = "晴空万里";
+            else w = next.get((int) (Math.random() * next.size()));   // 占卜更偏向“给出变化”，不像真实航行那样大概率维持
+            days.add(Map.of("day", "第 " + d + " 天", "weather", w, "help", WEATHER_HELP.getOrDefault(w, "")));
+        }
+        tmpl.convertAndSend("/topic/player/" + clientId + "/forecast",
+                Map.of("from", (p.weather == null ? "晴空万里" : p.weather), "days", days));
+    }
+
+    /** 天气连着心情：晴好多云则心情大好、哼两句船歌；坏天气则心里打鼓，怕有什么不测。
+     *  返回的整段叙事进航海日志；同时把「心情OS」单独写入 v.mood 供界面常驻显示。 */
+    private String weatherMood(String clientId, String weather, Voyage v) {
         Narrator n = narrator(clientId);
         String scene = sceneOf(clientId, weather);
         String mood = switch (weather) {
@@ -597,6 +852,7 @@ public class GameService {
                     "风暖浪平，你悠哉得就差来口小酒了",
                     "海天一色的晴，连迈出的步子都要轻快几分");
         };
+        if (v != null) v.mood = mood;
         return scene + "。" + mood;
     }
 
@@ -656,47 +912,29 @@ public class GameService {
         };
     }
 
+    /** 海盗来袭：把叙事写进 seaLog+eventDetail，挂上 pendCombat 等玩家在「迎战/甩开/花钱消灾」之间选；
+     *  实际扣钱/扣货在 sailDecision 里按选择结算，让玩家有真正的决策空间。 */
     private void pirateEvent(Player p, String clientId, Voyage v) {
         Narrator n = narrator(clientId);
-        int loss = 1 + (int) (Math.random() * 10);              // 最多 10 金币
-        int lost = Math.min(loss, p.gold);
-        p.gold -= lost;
         String approach = n.slot("pirApproach",
                 "远方水线上缓缓冒出一叶黑帆",
                 "桅顶的瞭望哨传来一声变了调的惊呼——“船！”",
                 "一艘船影无声无息地贴了上来",
                 "海雾里钻出一艘挂着破黑旗的快船",
                 "海风忽然送来一股桐油味——不好，是船！");
-        if (lost > 0) {
-            String board = n.slot("pirBoard",
-                    "几只布满刺青的手臂攀上船舷，刀光一闪，一群海盗齐刷刷跳上甲板",
-                    "铁钩一扬，绳梯搭上船舷，灯笼的火光照出一张张贪婪的脸",
-                    "他们砸开舱门把货舱翻了个底朝天，又朝你伸出手",
-                    "领头的头目脚下踩着你的箱子，手里掂着匕首，意思不言自明",
-                    "刀把子在船舷上笃笃敲了两下，要钱还是要命，就等你一句话");
-            v.seaLog.add("🏴【海盗】" + approach + "。" + board + "！");
-            v.seaLog.add("💰 被抢走 " + lost + " 金币！");
-            v.seaLog.add("（内心OS：*" + n.slot("pirOs",
-                    "这帮天杀的！等我攒够了钱，雇一队火枪手把他们全扔海里喂鱼！",
-                    "气炸了！这笔账我记下了，改日连本带利讨回来！",
-                    "呜……存了这么久的钱，这一下全没了，心都在滴血！",
-                    "人在舱檐下，不得不低头。可这口气，我是真咽不下去……",
-                    "好汉不吃眼前亏，先保住命要紧。可这些钱……啊啊啊！",
-                    "我盯着他们离去的船影，把每个刺青都刻进了脑子里。",
-                    "破财消灾，破财消灾……我数着空荡荡的钱袋，拼命劝自己冷静。",
-                    "穷家富路，这下真穷到家了。罢了，玩命把这票货卖个好价再赚回来！"
-            ) + "*）");
-        } else {
-            v.seaLog.add("🏴【海盗】" + approach + "。" + n.slot("pirEmpty",
-                    "海盗们翻遍全船舱也没搜出一个子儿，照着船舷啐了一口，骂骂咧咧地扬帆去了",
-                    "他们撬开你身上唯一的口袋，连个铜板都没摸到，扫兴地撤了",
-                    "领头的掂了掂空钱袋，嫌晦气，一脚踢回你怀里，带着人撤了") + "。");
-            v.seaLog.add("（内心OS：*" + n.slot("pirEmptyOs",
-                    "穷得叮当响倒还躲过一劫……怎么还有点小得意？",
-                    "哈哈，光脚的不怕穿鞋的，钱袋空空就是我的护身符！",
-                    "等老子赚了钱，第一件事就是把你们这伙都赎了当苦力，看还敢劫穷船！"
-            ) + "*）");
-        }
+        String board = n.slot("pirBoard",
+                "几只布满刺青的手臂攀上船舷，刀光一闪，一群海盗齐刷刷跳上甲板",
+                "铁钩一扬，绳梯搭上船舷，灯笼的火光照出一张张贪婪的脸",
+                "他们砸开舱门把货舱翻了个底朝天，又朝你伸出手",
+                "领头的头目脚下踩着你的箱子，手里掂着匕首，意思不言自明",
+                "刀把子在船舷上笃笃敲了两下，要钱还是要命，就等你一句话");
+
+        List<String> lines = new ArrayList<>();
+        lines.add("🏴【海盗】" + approach + "。" + board + "！");
+        lines.add("⚔️ 怎么办？—— 迎战 / 甩开 / 花钱消灾（5 金币）");
+        addAllLog(v, lines);
+        v.eventDetail = List.copyOf(lines);
+        v.pendCombat = true;
     }
 
     private void bottleEvent(Player p, String clientId, Voyage v) {
@@ -708,6 +946,7 @@ public class GameService {
                 "一堆浮碎里有个玻璃瓶晃晃悠悠地碰上了船底",
                 "一只缠着海草的漂流瓶在浪尖一沉一浮，被你眼疾手快抄了起来");
 
+        List<String> lines = new ArrayList<>();
         int kind = (int) (Math.random() * 100);
         if (kind < 35) {
             int gain = 5 + (int) (Math.random() * 26);          // 5~30 金币
@@ -716,9 +955,9 @@ public class GameService {
                     "撬开瓶口的蜡封，骨碌碌滚出一把亮闪闪的金币",
                     "倒出来——竟是一小袋沉甸甸的金币",
                     "摇了摇，瓶里哗啦作响，撞开一瞧，满满半瓶全是钱");
-            v.seaLog.add("💰【漂流瓶】" + found + "，" + content + "！");
-            v.seaLog.add("✨ 金币 +" + gain + "！");
-            v.seaLog.add("（内心OS：*" + n.slot("botCoinOs",
+            lines.add("💰【漂流瓶】" + found + "，" + content + "！");
+            lines.add("✨ 金币 +" + gain + "！");
+            lines.add("（内心OS：*" + n.slot("botCoinOs",
                     "发了发了！！这运气，昨晚是不是烧了高香？！",
                     "哪位货主这么大方，把财宝直接往海里送？多谢多谢！",
                     "我摸着热乎乎的金币，笑得像个偷到松果的松鼠。",
@@ -732,9 +971,9 @@ public class GameService {
                     "展开一看，竟是一张画着大红叉的藏宝图",
                     "纸卷里卷着一张泛黄海图，某处标了个醒目的红叉",
                     "是一张标了沉船位置的海图，看水色方位，离这儿不远");
-            v.seaLog.add("🗺【漂流瓶】" + found + "。" + content + "！你按图摸索着，竟真捞起一小箱陈年银币！");
-            v.seaLog.add("✨ 金币 +" + gain + "！（沉船宝藏）");
-            v.seaLog.add("（内心OS：*" + n.slot("botMapOs",
+            lines.add("🗺【漂流瓶】" + found + "。" + content + "！你按图摸索着，竟真捞起一小箱陈年银币！");
+            lines.add("✨ 金币 +" + gain + "！（沉船宝藏）");
+            lines.add("（内心OS：*" + n.slot("botMapOs",
                     "祖坟冒青烟了这是！今晚靠岸必须开瓶好酒庆功！",
                     "嘿嘿，这可比没日没夜地跑商来钱快多了……",
                     "我把海图小心翼翼地贴胸放着：这要是顺，后半程本钱都有了！",
@@ -749,9 +988,9 @@ public class GameService {
                         "油布里裹着一份上等" + goodName(item) + "，光闻味儿就知道是稀罕货",
                         "是一只封蜡完好的小罐，撬开竟装着上乘" + goodName(item),
                         "布里包着的" + goodName(item) + "连包装都完好，看着就值钱");
-                v.seaLog.add("📦【漂流瓶】" + found + "，" + content + "！");
-                v.seaLog.add("✨ 白捡 " + goodName(item) + " ×1（免费入舱）！");
-                v.seaLog.add("（内心OS：*" + n.slot("botCargoOs",
+                lines.add("📦【漂流瓶】" + found + "，" + content + "！");
+                lines.add("✨ 白捡 " + goodName(item) + " ×1（免费入舱）！");
+                lines.add("（内心OS：*" + n.slot("botCargoOs",
                         "不用花一个子儿就到手的货，这可是开门红！",
                         "好家伙，光这一件就够我这趟回本了！",
                         "我掂了掂分量，乐得直搓手：天上掉的馅饼，不吃白不吃！",
@@ -763,9 +1002,9 @@ public class GameService {
                         "里面是半瓶朗姆酒，你掀开瓶口就灌了一大口",
                         "敲开瓶塞，一股甜酒的香气直往鼻子里钻，你灌了满满一大口",
                         "是陈年的朗姆，一口下去，暖意从嗓子一路烧到心口");
-                v.seaLog.add("🍾【漂流瓶】" + found + "，" + content + "。");
-                v.seaLog.add("✨（舱位已满，贪杯也算收获了快乐……和 5 枚金币）");
-                v.seaLog.add("（内心OS：*" + n.slot("botRumOs",
+                lines.add("🍾【漂流瓶】" + found + "，" + content + "。");
+                lines.add("✨（舱位已满，贪杯也算收获了快乐……和 5 枚金币）");
+                lines.add("（内心OS：*" + n.slot("botRumOs",
                         "在海上能喝上这一口热酒，这日子值了！",
                         "我不舍得一口喝完，又舍不得放手——干脆揣怀里暖着，慢慢品。",
                         "酒壮怂人胆，看这海，竟也有三分可爱了！"
@@ -778,8 +1017,8 @@ public class GameService {
                     "“娘腌的咸菜还给你留着呢。人壮实了，就早点回家。”",
                     "“院里那棵石榴又红了，今年结得特别多。”",
                     "“你若能回来，海风都会替我说想你。”");
-            v.seaLog.add("💌【漂流瓶】" + found + "，展开信纸：" + msg);
-            v.seaLog.add("（内心OS：*" + n.slot("botLetterOs",
+            lines.add("💌【漂流瓶】" + found + "，展开信纸：" + msg);
+            lines.add("（内心OS：*" + n.slot("botLetterOs",
                     "鼻子一酸，这茫茫大海上，原来还有人惦记着我。我把信小心翼翼地藏进怀里。",
                     "眼眶热了热，我别过脸去假装看海，趁没人注意，把信叠好收进胸口。",
                     "看罢良久无言，终于还是把信收好，长长地呼出一口气。",
@@ -787,6 +1026,8 @@ public class GameService {
                     "盯着那几行字看了好久，我突然特别想靠岸——真的，想回家了。"
             ) + "*）");
         }
+        addAllLog(v, lines);
+        v.eventDetail = List.copyOf(lines);
     }
 
     private void lightningEvent(Player p, String clientId, Voyage v) {
@@ -798,32 +1039,37 @@ public class GameService {
                 "闪电像个发了怒的巨人，一拳凿在船顶上，火光四溅",
                 "雷声和火光同时炸亮——桅顶已经烧了起来");
 
+        List<String> lines = new ArrayList<>();
         int total = p.cargo.values().stream().mapToInt(Integer::intValue).sum();
         if (total <= 0) {
-            v.seaLog.add("⚡【雷击】" + strike + "！");
-            v.seaLog.add("　好在船舱空空，火苗没烧到货，只把" + n.slot("lgtEmptyAft",
+            lines.add("⚡【雷击】" + strike + "！");
+            lines.add("　好在船舱空空，火苗没烧到货，只把" + n.slot("lgtEmptyAft",
                     "半面帆燎得焦黑",
                     "船舷熏出一片黑印",
                     "一根缆绳烧断了半截") + "。");
-            v.seaLog.add("（内心OS：*" + n.slot("lgtEmptyOs",
+            lines.add("（内心OS：*" + n.slot("lgtEmptyOs",
                     "好险……！命还在，比啥都强。回头得给妈祖上炷香。",
                     "空船也有空船的好——烧了不心疼，货单干干净净！",
                     "后背一层冷汗。这要是装了货，可就全交代了。",
                     "我望着那片焦痕直叹气：这意头……怕是要顺一阵风再转运。"
             ) + "*）");
+            addAllLog(v, lines);
+            v.eventDetail = List.copyOf(lines);
             return;
         }
 
         int pct = 1 + (int) (Math.random() * 10);                // 最多减少 10%
         int lossUnits = Math.max(1, (int) Math.ceil(total * pct / 100.0));
         List<String> lostDesc = new ArrayList<>();
-        for (Map.Entry<String, Integer> e : p.cargo.entrySet()) {
+        // 用 keySet 快照遍历：下面会 remove/put，直接迭代 entrySet 会抛 ConcurrentModificationException
+        for (String key : List.copyOf(p.cargo.keySet())) {
             if (lossUnits <= 0) break;
-            int take = Math.min(e.getValue(), lossUnits);
+            int have = p.cargo.getOrDefault(key, 0);
+            int take = Math.min(have, lossUnits);
             if (take <= 0) continue;
-            p.cargo.merge(e.getKey(), -take, Integer::sum);
-            if (p.cargo.get(e.getKey()) <= 0) p.cargo.remove(e.getKey());
-            lostDesc.add(goodName(e.getKey()) + "×" + take);
+            int remain = have - take;
+            if (remain <= 0) p.cargo.remove(key); else p.cargo.put(key, remain);
+            lostDesc.add(goodName(key) + "×" + take);
             lossUnits -= take;
         }
         String aft = n.slot("lgtAft",
@@ -831,9 +1077,9 @@ public class GameService {
                 "火苗蹿起又被湿麻布扑灭，可回过神，舱里的货已经少了一角",
                 "烟呛得你睁不开眼，等分清水火，甲板上已经散落着好几只空箱",
                 "你嘶吼着往下泼水，总算压住了火，可那些装货的木箱，还是被卷走了两只");
-        v.seaLog.add("⚡【雷击】" + strike + "！" + aft + "……");
-        v.seaLog.add("📦 货物损失 " + String.join("、", lostDesc) + "（约 -" + pct + "%）！");
-        v.seaLog.add("（内心OS：*" + n.slot("lgtOs",
+        lines.add("⚡【雷击】" + strike + "！" + aft + "……");
+        lines.add("📦 货物损失 " + String.join("、", lostDesc) + "（约 -" + pct + "%）！");
+        lines.add("（内心OS：*" + n.slot("lgtOs",
                 "这一船的货，眼看着就白拉了一大截……我的心在滴血啊！",
                 "啊啊啊！攒了这么久的货！老天爷你就不能挑别人家的船劈吗？！",
                 "行吧……能活着就是万幸。可这损失，光想想就胸口疼。",
@@ -842,6 +1088,8 @@ public class GameService {
                 "祸不单行哪……我抬头望天，黑云里又滚过来一声闷雷。",
                 "手还在抖，腿也发软。可船还得开、钱还得赚，我扶着船舷，狠狠咽了口唾沫。"
         ) + "*）");
+        addAllLog(v, lines);
+        v.eventDetail = List.copyOf(lines);
     }
 
     private String goodName(String id) {
@@ -936,7 +1184,13 @@ public class GameService {
                 .toList());
 
         state.put("goods", GOODS.stream()
-                .map(g -> Map.of("id", g.id(), "name", g.name()))
+                .map(g -> {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("id", g.id());
+                    m.put("name", g.name());
+                    m.put("homeRegion", GOOD_HOME_REGION.getOrDefault(g.id(), ""));
+                    return m;
+                })
                 .toList());
 
         // 航行状态
@@ -949,23 +1203,29 @@ public class GameService {
             vv.put("destName", portName(v.destId));
             vv.put("totalKm", (int) Math.round(v.totalKm));
             vv.put("traveledKm", (int) Math.round(v.traveledKm));
+            vv.put("remainingKm", Math.max(0, (int) Math.round(v.totalKm - v.traveledKm)));
             vv.put("lat", v.lat);
             vv.put("lng", v.lng);
-            vv.put("clicks", (int) Math.ceil(v.totalKm / KM_PER_CLICK));
-            vv.put("clicked", (int) Math.ceil(Math.min(v.traveledKm, v.totalKm) / KM_PER_CLICK));
+            vv.put("sea", v.seaName);
             vv.put("offered", v.offeredId == null
                     ? null
                     : Map.of("id", v.offeredId, "name", portName(v.offeredId)));
             vv.put("departed", v.departed);
             vv.put("weather", p.weather);
             vv.put("weatherWarned", v.weatherWarned);
+            vv.put("mood", v.mood);
+            vv.put("event", v.event);
+            vv.put("eventDetail", v.eventDetail == null ? List.of() : List.copyOf(v.eventDetail));
+            vv.put("pendCombat", v.pendCombat);
             vv.put("seaLog", List.copyOf(v.seaLog));
+            vv.put("newLines", List.copyOf(v.newLines));
             state.put("voyage", vv);
         } else {
             state.put("voyage", null);
         }
 
         tmpl.convertAndSend("/topic/player/" + clientId + "/state", state);
+        if (p.voyage != null) p.voyage.newLines.clear();   // 本次动作的新增行已下发，立刻清空避免泄漏到下一次推送
     }
 
     /** 把最新行情推送给某个港口的所有在线玩家（玩家买卖会影响同港其他人） */
@@ -986,6 +1246,16 @@ public class GameService {
     private String portName(String id) {
         Port p = portMap.get(id);
         return p != null ? p.name() : id;
+    }
+
+    /** 追加日志行：同时写进 seaLog（全量航海日志）和 newLines（本次动作新增行，前端事件卡直接展示） */
+    private static void addLog(Voyage v, String... lines) {
+        for (String line : lines) { v.seaLog.add(line); v.newLines.add(line); }
+    }
+
+    private static void addAllLog(Voyage v, List<String> lines) {
+        v.seaLog.addAll(lines);
+        v.newLines.addAll(lines);
     }
 
     private static void trim(List<String> log) {
