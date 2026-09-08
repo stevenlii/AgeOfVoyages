@@ -140,21 +140,26 @@ public class GameService {
     // ---------- 指令 ----------
 
     public void login(LoginRequest r) {
-        Player p = players.computeIfAbsent(r.clientId(), k -> new Player());
-        // 从 MySQL 恢复已保存的进度
-        PlayerEntity e = repo.findById(r.clientId());
-        if (e != null) {
-            p.name = e.name;
-            p.gold = e.gold;
-            p.port = e.port;
-            p.cargoCap = e.cargoCap;
-            p.cargo = new HashMap<>(e.cargo);
-            // 旧版自动航行标记：重启后一律回到出发港，手动航行不跨重启恢复
-            if (e.traveling) {
-                p.traveling = false;
+        Player p = players.get(r.clientId());
+        if (p == null) {
+            // 本进程第一次见到该玩家：从 MySQL 恢复已保存进度
+            p = new Player();
+            PlayerEntity e = repo.findById(r.clientId());
+            if (e != null) {
+                p.name = e.name;
+                p.gold = e.gold;
+                p.port = e.port;
+                p.cargoCap = e.cargoCap;
+                p.cargo = new HashMap<>(e.cargo);
+                // 旧版自动航行标记：重启后一律回到出发港，手动航行不跨重启恢复
+                if (e.traveling) {
+                    p.traveling = false;
+                }
             }
-            p.voyage = null;
+            players.put(r.clientId(), p);
         }
+        // 若玩家已在内存中（同一浏览器刷新 / 开第二个标签页），保留其进行中的航程与金币，
+        // 不再用数据库里的旧值覆盖——否则航行途中捡到的钱会被“抹掉”。
         if (r.name() != null && !r.name().isBlank()) p.name = r.name();
         persist(p, r.clientId());
         sendState(r.clientId());
@@ -278,6 +283,7 @@ public class GameService {
         v.seaLog.add(weatherMood(r.clientId(), weather));             // 天气连着心情：好天开心，坏天忐忑
         if (Math.random() < 0.30) v.seaLog.add(ambientEvent(r.clientId(), weather)); // 海上小彩蛋
         rollSeaEvents(p, r.clientId(), v, weather);                   // 大事件：漂流瓶(远近都有) / 海盗·雷击(只在大洋长途)
+        persist(p, r.clientId());                                     // 事件增减的金币/货物立即入库，刷新或重连不会丢
 
         // 检测前方途经地
         detectWaypoint(v, prevLat, prevLng);
