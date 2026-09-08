@@ -30,4 +30,6 @@ public class Voyage {
     public double lastPirateKm = -1e9;
     /** 最近一次遭雷击时的已航行公里数（与上一次劈船拉开距离） */
     public double lastLightningKm = -1e9;
+    /** 出发前已就恶劣海况提醒过（第二次按「出发」才真正启航） */
+    public boolean weatherWarned = false;
 }

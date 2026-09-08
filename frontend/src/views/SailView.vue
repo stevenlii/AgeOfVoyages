@@ -82,18 +82,24 @@ function goMarket() {
     <!-- 航行中 -->
     <div v-if="game.voyage" class="panel">
       <b>⛵ {{ game.voyage.departed ? '航程' : '航线（未出发）' }}：{{ game.voyage.fromName }} → {{ game.voyage.destName }}</b>
+      <p v-if="game.voyage.weather" class="dockweather">🌤 当前港外海况：{{ game.voyage.weather }}</p>
       <div class="stats">
         已航行 <b>{{ game.voyage.traveledKm }}</b> / {{ game.voyage.totalKm }} 公里
         ｜ {{ progress }}%
       </div>
       <div class="bar"><div class="fill" :style="{ width: progress + '%' }"></div></div>
 
+      <p v-if="!game.voyage.departed && game.voyage.weatherWarned" class="storm-warn">
+        ⚠️ 现在出海危险（{{ game.voyage.weather }}）——再按一次「出发」是执意启航，或「返回」改期。
+      </p>
+
       <div class="sailrow">
         <button
           class="sailbtn"
+          :class="{ warn: game.voyage.weatherWarned }"
           :disabled="!!game.voyage.offered"
           @click="doSail"
-        >{{ game.voyage.departed ? '⛵ 前进 10 公里' : '⛵ 出发！前进 10 公里' }}</button>
+        >{{ game.voyage.departed ? '⛵ 前进 10 公里' : (game.voyage.weatherWarned ? '⛈ 仍要启航！' : '⛵ 出发！前进 10 公里') }}</button>
         <button
           v-if="game.voyage.departed"
           class="backbtn"
@@ -119,6 +125,9 @@ function goMarket() {
 
 <style scoped>
   .hint { color:#8899aa; font-size:13px; }
+  .dockweather { margin:0 0 2px; font-size:13px; color:#8fb3d9; }
+  .storm-warn { color:#ffd479; font-size:13px; border:1px solid #ffd479; border-radius:6px; padding:6px 8px; background:#241c10; margin:4px 0 2px; }
+  .sailbtn.warn { background:#5a2c1c; }
   .stats { margin:8px 0; font-size:14px; }
   .bar { height:8px; background:#1c2742; border-radius:4px; overflow:hidden; margin:6px 0 10px; }
   .fill { height:100%; background:#34507f; transition:width .3s; }

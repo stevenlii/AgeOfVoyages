@@ -239,8 +239,18 @@ public class GameService {
             return;
         }
 
-        // 前进（首次点击确认「出发」）
+        // 前进（首次点击确认「出发」：若当时海况恶劣，先提醒一次，不真正开船）
         boolean justDeparted = !v.departed;
+        if (justDeparted) {
+            String w0 = driftWeather(p);
+            if (isExtreme(w0) && !v.weatherWarned) {
+                v.weatherWarned = true;
+                v.seaLog.add("⚠️ 港外海况恶劣（" + w0 + "），现在出航太危险！若执意要开船，请再按一次「出发」；想改期就点「返回」留在港里。");
+                trim(v.seaLog);
+                sendState(r.clientId());
+                return;
+            }
+        }
         v.departed = true;
         double step = Math.min(KM_PER_CLICK, v.totalKm - v.traveledKm);
         double brng = bearingDeg(v.lat, v.lng, dest.lat(), dest.lng());
@@ -448,6 +458,11 @@ public class GameService {
             p.weather = pool.get((int) (Math.random() * pool.size()));
         }
         return p.weather;
+    }
+
+    /** 是否算“恶劣海况”（出发前会就这种情况先询问是否真的要开船） */
+    private boolean isExtreme(String weather) {
+        return "下雷雨".equals(weather) || "狂风大作".equals(weather);
     }
 
     /** 当前航位离最近港口多少公里（判断是否已到“海中间”） */
@@ -936,6 +951,8 @@ public class GameService {
                     ? null
                     : Map.of("id", v.offeredId, "name", portName(v.offeredId)));
             vv.put("departed", v.departed);
+            vv.put("weather", p.weather);
+            vv.put("weatherWarned", v.weatherWarned);
             vv.put("seaLog", List.copyOf(v.seaLog));
             state.put("voyage", vv);
         } else {
