@@ -1,6 +1,7 @@
 package com.ageofvoyages.controller;
 
 import com.ageofvoyages.dto.ChatRequest;
+import com.ageofvoyages.dto.ForecastRequest;
 import com.ageofvoyages.dto.LoginRequest;
 import com.ageofvoyages.dto.SailDecisionRequest;
 import com.ageofvoyages.dto.SailRequest;
@@ -27,6 +28,9 @@ public class GameController {
 
     @MessageMapping("sail")
     public void sail(SailRequest r) { game.sail(r); }
+
+    @MessageMapping("forecast")
+    public void forecast(ForecastRequest r) { game.forecast(r.clientId()); }
 
     @MessageMapping("sailDecision")
     public void sailDecision(SailDecisionRequest r) { game.sailDecision(r); }

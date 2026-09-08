@@ -13,6 +13,8 @@ export const game = reactive({
   voyage: null,
   toast: '',
   logs: [],
+  forecast: [],
+  forecastFrom: '',
 })
 
 let client = null
@@ -83,6 +85,11 @@ export function init() {
         game.logs.push(JSON.parse(m.body).text)
         while (game.logs.length > 50) game.logs.shift()
       })
+      client.subscribe(`/topic/player/${clientId}/forecast`, (m) => {
+        const f = JSON.parse(m.body)
+        game.forecastFrom = f.from
+        game.forecast = f.days
+      })
       client.publish({
         destination: '/app/login',
         body: JSON.stringify({ clientId, name: playerName }),
@@ -112,6 +119,13 @@ export function decide(choice) {
   client?.publish({
     destination: '/app/sailDecision',
     body: JSON.stringify({ clientId, choice }),
+  })
+}
+
+export function forecast() {
+  client?.publish({
+    destination: '/app/forecast',
+    body: JSON.stringify({ clientId }),
   })
 }
 
